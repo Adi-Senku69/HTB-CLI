@@ -521,9 +521,19 @@ def cmd_spawn(id_or_name: str):
         print(f"  {C.BOLD}Name      :{C.RESET} {data.get('name')}")
         ip = data.get("ip")
         print(f"  {C.BOLD}Target IP :{C.RESET} {C.GREEN}{C.BOLD}{ip}{C.RESET}")
-        expires = parse_utc((data.get("playInfo") or {}).get("expires_at", "") or data.get("expires_at", ""))
+        expires = parse_utc(
+            (data.get("playInfo") or {}).get("expires_at", "")
+            or data.get("expires_at", "")
+        )
         if expires:
             print(f"  {C.BOLD}Expires   :{C.RESET} {fmt_dt(expires)}")
+
+        # Print info_status if present
+        status_msg = data.get("info_status", "")
+        if status_msg:
+            sep()
+            print(f"  {C.BOLD}Info      :{C.RESET} {C.YELLOW}{status_msg}{C.RESET}")
+
         sep()
         print(f"  {C.GRAY}Tip: sudo openvpn ~/path/to/your.ovpn{C.RESET}")
     else:
