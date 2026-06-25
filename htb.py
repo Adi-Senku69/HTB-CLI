@@ -170,11 +170,18 @@ def _fetch_all_pages(endpoint):
 # ─── Time helpers ──────────────────────────────────────────────────────────────
 
 def parse_utc(s):
+    """Parse ISO datetime string → always returns timezone-aware UTC datetime."""
     if not s:
         return None
+    s = s.strip()
+    # Normalise: replace Z suffix, ensure offset present
     s = s.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        # If naive (no tzinfo), assume UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
@@ -384,11 +391,14 @@ def cmd_active():
     print(f"  {C.BOLD}OS      :{C.RESET} {m.get('os','?')}")
     expires = parse_utc(m.get("expires_at", ""))
     if expires:
-        now = datetime.now(timezone.utc)
-        remaining = expires - now
-        h, rem = divmod(int(max(remaining.total_seconds(), 0)), 3600)
-        mi, s  = divmod(rem, 60)
-        print(f"  {C.BOLD}Expires :{C.RESET} {fmt_dt(expires)}  ({h}h {mi}m remaining)")
+        try:
+            now       = datetime.now(timezone.utc)
+            remaining = expires - now
+            h, rem    = divmod(int(max(remaining.total_seconds(), 0)), 3600)
+            mi, s     = divmod(rem, 60)
+            print(f"  {C.BOLD}Expires :{C.RESET} {fmt_dt(expires)}  ({C.YELLOW}{h}h {mi}m remaining{C.RESET})")
+        except Exception:
+            print(f"  {C.BOLD}Expires :{C.RESET} {fmt_dt(expires)}")
     sep()
 
 
@@ -412,53 +422,104 @@ def cmd_spawn(id_or_name: str):
 
     msg = result.get("message", "")
     if not result:
-        warn("No response from spawn endpoint — the machine may still be starting.")
+        # 403 "already active" lands here (we return {} on error)
+        # Immediately check if there's already an active machine
+        warn("Spawn blocked — checking if you already have an active machine ...")
+        active_now = get("/machine/active", silent=True).get("info") or {}
+        if active_now.get("ip"):
+            aname = active_now.get("name","?")
+            aip   = active_now.get("ip","?")
+            aid   = active_now.get("id","?")
+            if str(aid) == str(machine_id):
+                ok(f"{C.BOLD}Already spawned!{C.RESET}")
+            else:
+                warn(f"A different machine is active: {C.BOLD}{aname}{C.RESET} (ID: {aid})")
+                info(f"Stop it first:  python3 htb.py --stop {aname}")
+            sep()
+            print(f"  {C.BOLD}Name      :{C.RESET} {active_now.get('name')}")
+            print(f"  {C.BOLD}Target IP :{C.RESET} {C.GREEN}{C.BOLD}{aip}{C.RESET}")
+            expires_a = parse_utc(active_now.get("expires_at",""))
+            if expires_a:
+                print(f"  {C.BOLD}Expires   :{C.RESET} {fmt_dt(expires_a)}")
+            sep()
+            return
+        else:
+            warn("Could not determine active machine. Proceeding to poll ...")
     elif isinstance(msg, str) and ("already" in msg.lower() or "active" in msg.lower()):
-        warn(f"HTB: {msg}")
-        info("Polling for existing active machine IP ...")
+        warn(f"HTB says: {msg}")
+        active_now = get("/machine/active", silent=True).get("info") or {}
+        if active_now.get("ip"):
+            sep()
+            print(f"  {C.BOLD}Name      :{C.RESET} {active_now.get('name')}")
+            print(f"  {C.BOLD}Target IP :{C.RESET} {C.GREEN}{C.BOLD}{active_now.get('ip')}{C.RESET}")
+            sep()
+            return
     elif msg:
         info(f"Spawn response: {msg}")
 
-    # Fast polling: 2s for first 30s, then 5s for next 90s
-    ok("Polling for IP ...")
-    spin         = spinner_frames()
-    poll_schedule = [2]*15 + [5]*18  # 30s fast + 90s slow = 2m total
+    # ── Ultra-fast polling ───────────────────────────────────────────────
+    # Strategy: check IMMEDIATELY after spawn, then every 1s.
+    # Two parallel requests per tick (profile + active) to catch IP faster.
+    # Intervals: instant → 1s × 30 → 3s × 20  (total ~2.5 min timeout)
+    ok("Polling for IP — checking every second ...")
+    spin     = spinner_frames()
+    elapsed  = 0
 
-    for delay in poll_schedule:
-        time.sleep(delay)
-        frame = next(spin)
-        print(f"  {C.CYAN}{frame}{C.RESET} Waiting for IP ...", end="\r", flush=True)
+    def _check_ip():
+        """Fire both endpoints in parallel, return IP string or None."""
+        results = {}
 
-        # Check via profile
-        fresh = get(f"/machine/profile/{machine_id}", silent=True).get("info", {})
-        ip    = fresh.get("ip")
-        play2 = fresh.get("playInfo", {}) or {}
-        if ip and play2.get("isSpawned"):
-            print(" " * 45, end="\r")
-            ok(f"{C.BOLD}Machine is UP!{C.RESET}")
-            sep()
-            print(f"  {C.BOLD}Name      : {fresh.get('name')}{C.RESET}")
-            print(f"  {C.BOLD}Target IP : {C.GREEN}{C.BOLD}{ip}{C.RESET}")
-            expires = parse_utc(play2.get("expires_at", ""))
-            if expires:
-                print(f"  {C.BOLD}Expires   :{C.RESET} {fmt_dt(expires)}")
-            sep()
-            return
+        def _profile():
+            d = get(f"/machine/profile/{machine_id}", silent=True).get("info", {})
+            if d.get("ip") and (d.get("playInfo") or {}).get("isSpawned"):
+                results["profile"] = d
 
-        # Also check /machine/active as fallback
-        active_data = get("/machine/active", silent=True).get("info") or {}
-        if str(active_data.get("id")) == str(machine_id) and active_data.get("ip"):
-            print(" " * 45, end="\r")
-            ok(f"{C.BOLD}Machine is UP!{C.RESET}")
-            sep()
-            print(f"  {C.BOLD}Name      : {active_data.get('name')}{C.RESET}")
-            print(f"  {C.BOLD}Target IP : {C.GREEN}{C.BOLD}{active_data.get('ip')}{C.RESET}")
-            sep()
-            return
+        def _active():
+            d = get("/machine/active", silent=True).get("info") or {}
+            if str(d.get("id")) == str(machine_id) and d.get("ip"):
+                results["active"] = d
 
-    print(" " * 45, end="\r")
-    warn("Timed out waiting for IP (~2 min). Machine may still be starting.")
-    info("Run:  python3 htb.py --active")
+        t1 = threading.Thread(target=_profile)
+        t2 = threading.Thread(target=_active)
+        t1.start(); t2.start()
+        t1.join();  t2.join()
+
+        if "profile" in results:
+            return results["profile"], "profile"
+        if "active" in results:
+            return results["active"], "active"
+        return None, None
+
+    # Check immediately (0s delay) — machine might already be up
+    data, src = _check_ip()
+    if not data:
+        # Build schedule: 1s × 30 checks, then 3s × 20 checks
+        schedule = [1]*30 + [3]*20
+        for delay in schedule:
+            time.sleep(delay)
+            elapsed += delay
+            frame = next(spin)
+            print(f"  {C.CYAN}{frame}{C.RESET} Waiting for IP ... ({elapsed}s elapsed)", end="\r", flush=True)
+            data, src = _check_ip()
+            if data:
+                break
+
+    if data:
+        print(" " * 55, end="\r")
+        ok(f"{C.BOLD}Machine is UP!{C.RESET}  {C.GRAY}(detected in {elapsed}s){C.RESET}")
+        sep()
+        print(f"  {C.BOLD}Name      :{C.RESET} {data.get('name')}")
+        ip = data.get("ip")
+        print(f"  {C.BOLD}Target IP :{C.RESET} {C.GREEN}{C.BOLD}{ip}{C.RESET}")
+        expires = parse_utc((data.get("playInfo") or {}).get("expires_at", "") or data.get("expires_at", ""))
+        if expires:
+            print(f"  {C.BOLD}Expires   :{C.RESET} {fmt_dt(expires)}")
+        sep()
+        print(f"  {C.GRAY}Tip: sudo openvpn ~/path/to/your.ovpn{C.RESET}")
+    else:
+        print(" " * 55, end="\r")
+        warn(f"Timed out after ~{elapsed}s. Machine may still be starting.")
+        info("Run:  python3 htb.py --active")
 
 
 # ── --stop ────────────────────────────────────────────────────────────────────
